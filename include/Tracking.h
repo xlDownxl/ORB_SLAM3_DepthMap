@@ -116,6 +116,7 @@ public:
 #endif
 
 public:
+    void saveData(const Sophus::SE3f& pose, const std::vector<Eigen::Vector3f>& points, double timestamp);
 
     // Tracking states
     enum eTrackingState{
@@ -130,6 +131,7 @@ public:
 
     eTrackingState mState;
     eTrackingState mLastProcessedState;
+
 
     // Input sensor
     int mSensor;
@@ -153,6 +155,8 @@ public:
     list<KeyFrame*> mlpReferences;
     list<double> mlFrameTimes;
     list<bool> mlbLost;
+
+    
 
     // frames with estimated pose
     int mTrackedFr;
@@ -196,6 +200,8 @@ protected:
 
     // Main tracking function. It is independent of the input sensor.
     void Track();
+    std::vector<Eigen::Vector3f> TrackCustom(double timestamp);
+
 
     // Map initialization for stereo and RGB-D
     void StereoInitialization();

@@ -585,7 +585,7 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
     }
 }
 
-bool Frame::ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v)
+bool Frame::ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v, float &z)
 {
 
     // 3D in absolute coordinates
@@ -603,6 +603,9 @@ bool Frame::ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float 
         cout << "Negative depth: " << PcZ << endl;
         return false;
     }
+
+
+    z = PcZ;
 
     // Project in image and check it is not outside
     const float invz = 1.0f/PcZ;

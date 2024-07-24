@@ -133,6 +133,7 @@ public:
     // Reset the system (clear Atlas or the active map)
     void Reset();
     void ResetActiveMap();
+    void SavePointCloud(const string &filename);
 
     // All threads will be requested to finish.
     // It waits until all threads have finished.

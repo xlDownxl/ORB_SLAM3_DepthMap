@@ -659,6 +659,65 @@ void System::SaveKeyFrameTrajectoryTUM(const string &filename)
     f.close();
 }
 
+
+void System::SaveKeyFrameTrajectoryEuRoC(const string &filename)
+{
+    cout << endl << "Saving keyframe trajectory to " << filename << " ..." << endl;
+
+    vector<Map*> vpMaps = mpAtlas->GetAllMaps();
+    Map* pBiggerMap;
+    int numMaxKFs = 0;
+    for(Map* pMap :vpMaps)
+    {
+        if(pMap && pMap->GetAllKeyFrames().size() > numMaxKFs)
+        {
+            numMaxKFs = pMap->GetAllKeyFrames().size();
+            pBiggerMap = pMap;
+        }
+    }
+
+    if(!pBiggerMap)
+    {
+        std::cout << "There is not a map!!" << std::endl;
+        return;
+    }
+
+    vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
+    sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+
+    // Transform all keyframes so that the first keyframe is at the origin.
+    // After a loop closure the first keyframe might not be at the origin.
+    ofstream f;
+    f.open(filename.c_str());
+    f << fixed;
+
+    for(size_t i=0; i<vpKFs.size(); i++)
+    {
+        KeyFrame* pKF = vpKFs[i];
+
+       // pKF->SetPose(pKF->GetPose()*Two);
+
+        if(!pKF || pKF->isBad())
+            continue;
+        if (mSensor == IMU_MONOCULAR || mSensor == IMU_STEREO || mSensor==IMU_RGBD)
+        {
+            Sophus::SE3f Twb = pKF->GetImuPose();
+            Eigen::Quaternionf q = Twb.unit_quaternion();
+            Eigen::Vector3f twb = Twb.translation();
+            f << setprecision(6) << 1e9*pKF->mTimeStamp  << " " <<  setprecision(9) << twb(0) << " " << twb(1) << " " << twb(2) << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+
+        }
+        else
+        {
+            Sophus::SE3f Twc = pKF->GetPoseInverse();
+            Eigen::Quaternionf q = Twc.unit_quaternion();
+            Eigen::Vector3f t = Twc.translation();
+            f << setprecision(6) << 1e9*pKF->mTimeStamp << " " <<  setprecision(9) << t(0) << " " << t(1) << " " << t(2) << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+        }
+    }
+    f.close();
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename)
 {
 
@@ -1054,63 +1113,7 @@ void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
     f.close();
 }*/
 
-void System::SaveKeyFrameTrajectoryEuRoC(const string &filename)
-{
-    cout << endl << "Saving keyframe trajectory to " << filename << " ..." << endl;
 
-    vector<Map*> vpMaps = mpAtlas->GetAllMaps();
-    Map* pBiggerMap;
-    int numMaxKFs = 0;
-    for(Map* pMap :vpMaps)
-    {
-        if(pMap && pMap->GetAllKeyFrames().size() > numMaxKFs)
-        {
-            numMaxKFs = pMap->GetAllKeyFrames().size();
-            pBiggerMap = pMap;
-        }
-    }
-
-    if(!pBiggerMap)
-    {
-        std::cout << "There is not a map!!" << std::endl;
-        return;
-    }
-
-    vector<KeyFrame*> vpKFs = pBiggerMap->GetAllKeyFrames();
-    sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
-
-    // Transform all keyframes so that the first keyframe is at the origin.
-    // After a loop closure the first keyframe might not be at the origin.
-    ofstream f;
-    f.open(filename.c_str());
-    f << fixed;
-
-    for(size_t i=0; i<vpKFs.size(); i++)
-    {
-        KeyFrame* pKF = vpKFs[i];
-
-       // pKF->SetPose(pKF->GetPose()*Two);
-
-        if(!pKF || pKF->isBad())
-            continue;
-        if (mSensor == IMU_MONOCULAR || mSensor == IMU_STEREO || mSensor==IMU_RGBD)
-        {
-            Sophus::SE3f Twb = pKF->GetImuPose();
-            Eigen::Quaternionf q = Twb.unit_quaternion();
-            Eigen::Vector3f twb = Twb.translation();
-            f << setprecision(6) << 1e9*pKF->mTimeStamp  << " " <<  setprecision(9) << twb(0) << " " << twb(1) << " " << twb(2) << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
-
-        }
-        else
-        {
-            Sophus::SE3f Twc = pKF->GetPoseInverse();
-            Eigen::Quaternionf q = Twc.unit_quaternion();
-            Eigen::Vector3f t = Twc.translation();
-            f << setprecision(6) << 1e9*pKF->mTimeStamp << " " <<  setprecision(9) << t(0) << " " << t(1) << " " << t(2) << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
-        }
-    }
-    f.close();
-}
 
 void System::SaveKeyFrameTrajectoryEuRoC(const string &filename, Map* pMap)
 {
@@ -1261,7 +1264,75 @@ void System::SaveTrajectoryKITTI(const string &filename)
     f.close();
 }
 
+void System::SavePointCloud(const string &filename){
+    // Code is based on MapDrawer::DrawMapPoints()
+    cout << endl << "Saving map point coordinates to " << filename << " ..." << endl;
+    cout << endl << "Number of maps is: " << mpAtlas->CountMaps() << endl;
 
+    // TODO Get all maps or is the current active map is enough?
+    // vector<Map*> vpAllMaps = mpAtlas->GetAllMaps()
+
+    Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if(!pActiveMap) {
+        cout << endl << "There is no active map (pActiveMap is null)" << endl;
+        return;
+    }
+
+    // Vectors containing pointers to MapPoint objects contained in the maps
+    // Vector of pointers for Map Points -- vpMPs
+    // Vector of pointers for Reference Map Points -- vpRefMPs
+    // TODO figure out the difference between Reference Map Points and normal Map Points
+    const vector<MapPoint*> &vpMPs = pActiveMap->GetAllMapPoints();
+    const vector<MapPoint*> &vpRefMPs = pActiveMap->GetReferenceMapPoints();
+
+    if(vpMPs.empty()){
+        cout << endl << "Vector of map points vpMPs is empty!" << endl;
+        return;
+    }
+
+    // Use a set for fast lookup of reference frames
+    set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
+
+    // Get the output file stream in fixed-point format for map points
+    ofstream f;
+    f << "pos_x, pos_y, pos_z";
+    f.open(filename.c_str());
+    f << fixed;
+
+    // TODO figure out if we need to consider whether the presence of IMU
+    // requires some transforms/exceptions
+
+    // Iterate over map points, skip "bad" ones and reference map points
+    for (size_t i=0, iend=vpMPs.size(); i<iend;i++)
+    {
+        if (vpMPs[i]->isBad() || spRefMPs.count(vpMPs[i])){
+            continue;
+        }
+        Eigen::Matrix<float,3,1> pos = vpMPs[i]->GetWorldPos();
+        f << pos(0) << ", " << pos(1) << ", " << pos(2) << endl;
+    }
+
+    // Close the output stream
+    f.close();
+
+    // Get the output file stream in fixed-point format for reference map points
+    f.open(("ref_" + filename).c_str());
+    f << "pos_x, pos_y, pos_z" << endl;
+    f << fixed;
+
+    // Iterate over reference map points, skip if bad
+    for (set<MapPoint*>::iterator sit=spRefMPs.begin(), send=spRefMPs.end(); sit!=send; sit++)
+    {
+        if((*sit)->isBad()){
+            continue;
+        }
+        Eigen::Matrix<float,3,1> pos = (*sit)->GetWorldPos();
+        f << pos(0) << ", " << pos(1) << ", " << pos(2) << endl;
+    }
+
+    // Close the output stream
+    f.close();
+}
 void System::SaveDebugData(const int &initIdx)
 {
     // 0. Save initialization trajectory

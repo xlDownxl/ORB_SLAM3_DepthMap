@@ -34,6 +34,10 @@
 #include <mutex>
 #include <chrono>
 
+#include <filesystem>
+#include <fstream>
+#include <iomanip>      // For std::setprecision
+#include <sstream>
 
 using namespace std;
 
@@ -1609,9 +1613,68 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
 #endif
 
     lastID = mCurrentFrame.mnId;
-    Track();
+    std::vector<Eigen::Vector3f> points;
+    points = TrackCustom(timestamp);
 
-    return mCurrentFrame.GetPose();
+    //print timestamp and output pose
+    //cout << "timestamp: " << timestamp << endl;
+    //cout << "pose: " << mCurrentFrame.GetImuPose().matrix() << endl;
+    //cout << "Number of points not outlier: " << points.size() << endl;
+    
+    //this was not working, 3d position aligns but rotation doesnt
+    //saveData(mCurrentFrame.GetPose().inverse(), points, timestamp);
+
+    //cout <<"___________________________________________"<<endl;
+
+    return mCurrentFrame.GetPose().inverse();
+}
+
+
+void Tracking::saveData(const Sophus::SE3f& pose, const std::vector<Eigen::Vector3f>& points, double timestamp) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(6) << timestamp;
+    std::string timestampStr = stream.str();
+
+    // Create file names based on timestamp
+    std::string poseFilename =  "poses_imu/"+ timestampStr + ".txt";
+    std::string pointsFilename =  "pointclouds/"+timestampStr + ".txt";
+
+    // Output to console
+    std::cout << std::endl << "Saving pose to " << poseFilename << " ..." << std::endl;
+    std::cout << "Saving point cloud to " << pointsFilename << " ..." << std::endl;
+
+    // Open files for writing
+    std::ofstream poseFile(poseFilename);
+    std::ofstream pointsFile(pointsFilename);
+
+    if (!poseFile.is_open() || !pointsFile.is_open()) {
+        std::cerr << "ERROR: Unable to open files for writing." << std::endl;
+        return;
+    }
+
+    // Write pose to file
+    Eigen::Quaternionf q = pose.unit_quaternion();
+    Eigen::Vector3f t = pose.translation();
+
+    cout << "saved pose: " << t(0) << " " << t(1) << " " << t(2) << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+    cout << "pose as rotation matrix: " << pose.matrix() << endl;
+
+    poseFile << std::fixed << std::setprecision(9) 
+             << t(0) << " " << t(1) << " " << t(2) << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+
+    // Write points to file
+    for (const auto& point : points) {
+        pointsFile << std::fixed << std::setprecision(6) 
+                   << point(0) << " " << point(1) << " " << point(2) << std::endl;
+    }
+
+    // Close files
+    poseFile.close();
+    pointsFile.close();
+
+    // Confirmation message
+    std::cout << "Data successfully saved." << std::endl;
 }
 
 
@@ -2199,6 +2262,8 @@ void Tracking::Track()
 
         // Update drawer
         mpFrameDrawer->Update(this);
+       
+        
         if(mCurrentFrame.isSet())
             mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
 
@@ -2329,6 +2394,611 @@ void Tracking::Track()
         }
     }
 #endif
+}
+
+std::vector<Eigen::Vector3f> Tracking::TrackCustom(double timestamp)
+{
+    std::vector<Eigen::Vector3f> vectorList;
+
+    if (bStepByStep)
+    {
+        std::cout << "Tracking: Waiting to the next step" << std::endl;
+        while(!mbStep && bStepByStep)
+            usleep(500);
+        mbStep = false;
+    }
+
+    if(mpLocalMapper->mbBadImu)
+    {
+        cout << "TRACK: Reset map because local mapper set the bad imu flag " << endl;
+        mpSystem->ResetActiveMap();
+        return vectorList;
+    }
+
+    Map* pCurrentMap = mpAtlas->GetCurrentMap();
+    if(!pCurrentMap)
+    {
+        cout << "ERROR: There is not an active map in the atlas" << endl;
+    }
+
+    if(mState!=NO_IMAGES_YET)
+    {
+        if(mLastFrame.mTimeStamp>mCurrentFrame.mTimeStamp)
+        {
+            cerr << "ERROR: Frame with a timestamp older than previous frame detected!" << endl;
+            unique_lock<mutex> lock(mMutexImuQueue);
+            mlQueueImuData.clear();
+            CreateMapInAtlas();
+            return vectorList;
+        }
+        else if(mCurrentFrame.mTimeStamp>mLastFrame.mTimeStamp+1.0)
+        {
+            // cout << mCurrentFrame.mTimeStamp << ", " << mLastFrame.mTimeStamp << endl;
+            // cout << "id last: " << mLastFrame.mnId << "    id curr: " << mCurrentFrame.mnId << endl;
+            if(mpAtlas->isInertial())
+            {
+
+                if(mpAtlas->isImuInitialized())
+                {
+                    cout << "Timestamp jump detected. State set to LOST. Reseting IMU integration..." << endl;
+                    if(!pCurrentMap->GetIniertialBA2())
+                    {
+                        mpSystem->ResetActiveMap();
+                    }
+                    else
+                    {
+                        CreateMapInAtlas();
+                    }
+                }
+                else
+                {
+                    cout << "Timestamp jump detected, before IMU initialization. Reseting..." << endl;
+                    mpSystem->ResetActiveMap();
+                }
+                return vectorList;
+            }
+
+        }
+    }
+
+
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && mpLastKeyFrame)
+        mCurrentFrame.SetNewBias(mpLastKeyFrame->GetImuBias());
+
+    if(mState==NO_IMAGES_YET)
+    {
+        mState = NOT_INITIALIZED;
+    }
+
+    mLastProcessedState=mState;
+
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !mbCreatedMap)
+    {
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_StartPreIMU = std::chrono::steady_clock::now();
+#endif
+        PreintegrateIMU();
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_EndPreIMU = std::chrono::steady_clock::now();
+
+        double timePreImu = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndPreIMU - time_StartPreIMU).count();
+        vdIMUInteg_ms.push_back(timePreImu);
+#endif
+
+    }
+    mbCreatedMap = false;
+
+    // Get Map Mutex -> Map cannot be changed
+    unique_lock<mutex> lock(pCurrentMap->mMutexMapUpdate);
+
+    mbMapUpdated = false;
+
+    int nCurMapChangeIndex = pCurrentMap->GetMapChangeIndex();
+    int nMapChangeIndex = pCurrentMap->GetLastMapChange();
+    if(nCurMapChangeIndex>nMapChangeIndex)
+    {
+        pCurrentMap->SetLastMapChange(nCurMapChangeIndex);
+        mbMapUpdated = true;
+    }
+    
+
+    if(mState==NOT_INITIALIZED)
+    {
+        if(mSensor==System::STEREO || mSensor==System::RGBD || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD)
+        {
+            StereoInitialization();
+        }
+        else
+        {
+            MonocularInitialization();
+        }
+
+        //mpFrameDrawer->Update(this);
+
+        if(mState!=OK) // If rightly initialized, mState=OK
+        {
+            mLastFrame = Frame(mCurrentFrame);
+            return vectorList;
+        }
+
+        if(mpAtlas->GetAllMaps().size() == 1)
+        {
+            mnFirstFrameId = mCurrentFrame.mnId;
+        }
+    }
+    else
+    {
+        // System is initialized. Track Frame.
+        bool bOK;
+
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_StartPosePred = std::chrono::steady_clock::now();
+#endif
+
+        // Initial camera pose estimation using motion model or relocalization (if tracking is lost)
+        if(!mbOnlyTracking)
+        {
+
+            // State OK
+            // Local Mapping is activated. This is the normal behaviour, unless
+            // you explicitly activate the "only tracking" mode.
+            if(mState==OK)
+            {
+
+                // Local Mapping might have changed some MapPoints tracked in last frame
+                CheckReplacedInLastFrame();
+
+                if((!mbVelocity && !pCurrentMap->isImuInitialized()) || mCurrentFrame.mnId<mnLastRelocFrameId+2)
+                {
+                    Verbose::PrintMess("TRACK: Track with respect to the reference KF ", Verbose::VERBOSITY_DEBUG);
+                    bOK = TrackReferenceKeyFrame();
+                }
+                else
+                {
+                    Verbose::PrintMess("TRACK: Track with motion model", Verbose::VERBOSITY_DEBUG);
+                    bOK = TrackWithMotionModel();
+                    if(!bOK)
+                        bOK = TrackReferenceKeyFrame();
+                }
+
+
+                if (!bOK)
+                {
+                    if ( mCurrentFrame.mnId<=(mnLastRelocFrameId+mnFramesToResetIMU) &&
+                         (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD))
+                    {
+                        mState = LOST;
+                    }
+                    else if(pCurrentMap->KeyFramesInMap()>10)
+                    {
+                        // cout << "KF in map: " << pCurrentMap->KeyFramesInMap() << endl;
+                        mState = RECENTLY_LOST;
+                        mTimeStampLost = mCurrentFrame.mTimeStamp;
+                    }
+                    else
+                    {
+                        mState = LOST;
+                    }
+                }
+            }
+            else
+            {
+
+                if (mState == RECENTLY_LOST)
+                {
+                    Verbose::PrintMess("Lost for a short time", Verbose::VERBOSITY_NORMAL);
+
+                    bOK = true;
+                    if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))
+                    {
+                        if(pCurrentMap->isImuInitialized())
+                            PredictStateIMU();
+                        else
+                            bOK = false;
+
+                        if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
+                        {
+                            mState = LOST;
+                            Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
+                            bOK=false;
+                        }
+                    }
+                    else
+                    {
+                        // Relocalization
+                        bOK = Relocalization();
+                        //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
+                        //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
+                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>3.0f && !bOK)
+                        {
+                            mState = LOST;
+                            Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
+                            bOK=false;
+                        }
+                    }
+                }
+                else if (mState == LOST)
+                {
+
+                    Verbose::PrintMess("A new map is started...", Verbose::VERBOSITY_NORMAL);
+
+                    if (pCurrentMap->KeyFramesInMap()<10)
+                    {
+                        mpSystem->ResetActiveMap();
+                        Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
+                    }else
+                        CreateMapInAtlas();
+
+                    if(mpLastKeyFrame)
+                        mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
+
+                    Verbose::PrintMess("done", Verbose::VERBOSITY_NORMAL);
+
+                    return vectorList;
+                }
+            }
+
+        }
+        else
+        {
+            // Localization Mode: Local Mapping is deactivated (TODO Not available in inertial mode)
+            if(mState==LOST)
+            {
+                if(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+                    Verbose::PrintMess("IMU. State LOST", Verbose::VERBOSITY_NORMAL);
+                bOK = Relocalization();
+            }
+            else
+            {
+                if(!mbVO)
+                {
+                    // In last frame we tracked enough MapPoints in the map
+                    if(mbVelocity)
+                    {
+                        bOK = TrackWithMotionModel();
+                    }
+                    else
+                    {
+                        bOK = TrackReferenceKeyFrame();
+                    }
+                }
+                else
+                {
+                    // In last frame we tracked mainly "visual odometry" points.
+
+                    // We compute two camera poses, one from motion model and one doing relocalization.
+                    // If relocalization is sucessfull we choose that solution, otherwise we retain
+                    // the "visual odometry" solution.
+
+                    bool bOKMM = false;
+                    bool bOKReloc = false;
+                    vector<MapPoint*> vpMPsMM;
+                    vector<bool> vbOutMM;
+                    Sophus::SE3f TcwMM;
+                    if(mbVelocity)
+                    {
+                        bOKMM = TrackWithMotionModel();
+                        vpMPsMM = mCurrentFrame.mvpMapPoints;
+                        vbOutMM = mCurrentFrame.mvbOutlier;
+                        TcwMM = mCurrentFrame.GetPose();
+                    }
+                    bOKReloc = Relocalization();
+
+                    if(bOKMM && !bOKReloc)
+                    {
+                        mCurrentFrame.SetPose(TcwMM);
+                        mCurrentFrame.mvpMapPoints = vpMPsMM;
+                        mCurrentFrame.mvbOutlier = vbOutMM;
+
+                        if(mbVO)
+                        {
+                            for(int i =0; i<mCurrentFrame.N; i++)
+                            {
+                                if(mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+                                {
+                                    mCurrentFrame.mvpMapPoints[i]->IncreaseFound();
+                                }
+                            }
+                        }
+                    }
+                    else if(bOKReloc)
+                    {
+                        mbVO = false;
+                    }
+
+                    bOK = bOKReloc || bOKMM;
+                }
+            }
+        }
+
+        if(!mCurrentFrame.mpReferenceKF)
+            mCurrentFrame.mpReferenceKF = mpReferenceKF;
+
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_EndPosePred = std::chrono::steady_clock::now();
+
+        double timePosePred = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndPosePred - time_StartPosePred).count();
+        vdPosePred_ms.push_back(timePosePred);
+#endif
+
+
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_StartLMTrack = std::chrono::steady_clock::now();
+#endif
+        // If we have an initial estimation of the camera pose and matching. Track the local map.
+        if(!mbOnlyTracking)
+        {
+            if(bOK)
+            {
+                bOK = TrackLocalMap();
+
+            }
+            if(!bOK)
+                cout << "Fail to track local map!" << endl;
+        }
+        else
+        {
+            // mbVO true means that there are few matches to MapPoints in the map. We cannot retrieve
+            // a local map and therefore we do not perform TrackLocalMap(). Once the system relocalizes
+            // the camera we will use the local map again.
+            if(bOK && !mbVO)
+                bOK = TrackLocalMap();
+        }
+
+        if(bOK)
+            mState = OK;
+        else if (mState == OK)
+        {
+            if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+            {
+                Verbose::PrintMess("Track lost for less than one second...", Verbose::VERBOSITY_NORMAL);
+                if(!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())
+                {
+                    cout << "IMU is not or recently initialized. Reseting active map..." << endl;
+                    mpSystem->ResetActiveMap();
+                }
+
+                mState=RECENTLY_LOST;
+            }
+            else
+                mState=RECENTLY_LOST; // visual to lost
+
+            /*if(mCurrentFrame.mnId>mnLastRelocFrameId+mMaxFrames)
+            {*/
+                mTimeStampLost = mCurrentFrame.mTimeStamp;
+            //}
+        }
+
+        // Save frame if recent relocalization, since they are used for IMU reset (as we are making copy, it shluld be once mCurrFrame is completely modified)
+        if((mCurrentFrame.mnId<(mnLastRelocFrameId+mnFramesToResetIMU)) && (mCurrentFrame.mnId > mnFramesToResetIMU) &&
+           (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && pCurrentMap->isImuInitialized())
+        {
+            // TODO check this situation
+            Verbose::PrintMess("Saving pointer to frame. imu needs reset...", Verbose::VERBOSITY_NORMAL);
+            Frame* pF = new Frame(mCurrentFrame);
+            pF->mpPrevFrame = new Frame(mLastFrame);
+
+            // Load preintegration
+            pF->mpImuPreintegratedFrame = new IMU::Preintegrated(mCurrentFrame.mpImuPreintegratedFrame);
+        }
+
+        if(pCurrentMap->isImuInitialized())
+        {
+            if(bOK)
+            {
+                if(mCurrentFrame.mnId==(mnLastRelocFrameId+mnFramesToResetIMU))
+                {
+                    cout << "RESETING FRAME!!!" << endl;
+                    ResetFrameIMU();
+                }
+                else if(mCurrentFrame.mnId>(mnLastRelocFrameId+30))
+                    mLastBias = mCurrentFrame.mImuBias;
+            }
+        }
+
+#ifdef REGISTER_TIMES
+        std::chrono::steady_clock::time_point time_EndLMTrack = std::chrono::steady_clock::now();
+
+        double timeLMTrack = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndLMTrack - time_StartLMTrack).count();
+        vdLMTrack_ms.push_back(timeLMTrack);
+#endif
+
+        // Update drawer
+        mpFrameDrawer->Update(this);
+        int counter = 0;
+        
+        //init depth map
+        const int depth_map_width = 512;
+        const int depth_map_height = 512;
+        cv::Mat depth_map = cv::Mat::zeros(depth_map_height, depth_map_width, CV_32F);
+
+        for (int i = 0; i < mCurrentFrame.N; i++)
+        {
+            if (mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+            {
+                //print the point info
+                counter=counter+1;
+
+                vectorList.push_back(mCurrentFrame.mvpMapPoints[i]->GetWorldPos());  //here i have all in the current frame, pose and map, depth maybe even according to comment
+                cv::Point2f kp;
+                float u, v, z;
+                bool projection_success = mCurrentFrame.ProjectPointDistort(mCurrentFrame.mvpMapPoints[i], kp, u, v, z);
+
+                if (projection_success) {
+                    // Print the point info
+                    /*std::cout << "kp: " << kp << std::endl;
+                    std::cout << "u: " << u << std::endl;
+                    std::cout << "v: " << v << std::endl;
+                    std::cout << "z: " << z << std::endl;
+*/
+                    // Ensure the projected coordinates are within the bounds of the depth map
+                    int pixel_x = static_cast<int>(std::round(u));
+                    int pixel_y = static_cast<int>(std::round(v));
+                    
+                    if (pixel_x >= 0 && pixel_x < depth_map_width && pixel_y >= 0 && pixel_y < depth_map_height) {
+                        // Update the depth map with the depth value (z) at the corresponding pixel coordinates
+                        depth_map.at<float>(pixel_y, pixel_x) = z;
+                    }
+                }
+                else{
+                    //std::cout << "Projection failed" << std::endl;
+                
+                }
+            }
+        }
+
+        
+        // Important: This needs folder adjustment in practice. also folder needs to exist before.
+
+        std::ostringstream timestamp_str;
+        timestamp_str << std::fixed << std::setprecision(6) << timestamp;
+
+        //cout << "zzzzzzzzzzzzzzzz timestamp_str: " << timestamp_str.str() << endl;
+        std::string filename = "orb_depth/" + timestamp_str.str() + ".png";
+
+        depth_map = depth_map *5000; // TUM depth scaling factor
+
+
+        cv::Mat depth_map_int16;
+        // Convert from CV_32F to CV_16S
+        depth_map.convertTo(depth_map_int16, CV_16U);
+
+        cv::imwrite(filename, depth_map_int16);
+        //std::cout << "Depth map saved as " << filename << std::endl;
+
+        
+        if(mCurrentFrame.isSet())
+            mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
+
+        if(bOK || mState==RECENTLY_LOST)
+        {
+            // Update motion model
+            if(mLastFrame.isSet() && mCurrentFrame.isSet())
+            {
+                Sophus::SE3f LastTwc = mLastFrame.GetPose().inverse();
+                mVelocity = mCurrentFrame.GetPose() * LastTwc;
+                mbVelocity = true;
+            }
+            else {
+                mbVelocity = false;
+            }
+
+            if(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+                mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
+
+            // Clean VO matches
+            for(int i=0; i<mCurrentFrame.N; i++)
+            {
+                MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+                if(pMP)
+                    if(pMP->Observations()<1)
+                    {
+                        mCurrentFrame.mvbOutlier[i] = false;
+                        mCurrentFrame.mvpMapPoints[i]=static_cast<MapPoint*>(NULL);
+                    }
+            }
+
+            // Delete temporal MapPoints
+            for(list<MapPoint*>::iterator lit = mlpTemporalPoints.begin(), lend =  mlpTemporalPoints.end(); lit!=lend; lit++)
+            {
+                MapPoint* pMP = *lit;
+                delete pMP;
+            }
+            mlpTemporalPoints.clear();
+
+#ifdef REGISTER_TIMES
+            std::chrono::steady_clock::time_point time_StartNewKF = std::chrono::steady_clock::now();
+#endif
+            bool bNeedKF = NeedNewKeyFrame();
+
+            // Check if we need to insert a new keyframe
+            // if(bNeedKF && bOK)
+            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
+                                   (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
+                CreateNewKeyFrame();
+
+#ifdef REGISTER_TIMES
+            std::chrono::steady_clock::time_point time_EndNewKF = std::chrono::steady_clock::now();
+
+            double timeNewKF = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndNewKF - time_StartNewKF).count();
+            vdNewKF_ms.push_back(timeNewKF);
+#endif
+
+            // We allow points with high innovation (considererd outliers by the Huber Function)
+            // pass to the new keyframe, so that bundle adjustment will finally decide
+            // if they are outliers or not. We don't want next frame to estimate its position
+            // with those points so we discard them in the frame. Only has effect if lastframe is tracked
+            for(int i=0; i<mCurrentFrame.N;i++)
+            {
+                if(mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
+                    mCurrentFrame.mvpMapPoints[i]=static_cast<MapPoint*>(NULL);
+            }
+        }
+
+        // Reset if the camera get lost soon after initialization
+        if(mState==LOST)
+        {
+            if(pCurrentMap->KeyFramesInMap()<=10)
+            {
+                mpSystem->ResetActiveMap();
+                return vectorList;
+            }
+            if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+                if (!pCurrentMap->isImuInitialized())
+                {
+                    Verbose::PrintMess("Track lost before IMU initialisation, reseting...", Verbose::VERBOSITY_QUIET);
+                    mpSystem->ResetActiveMap();
+                    return vectorList;
+                }
+
+            CreateMapInAtlas();
+
+            return vectorList;
+        }
+
+        if(!mCurrentFrame.mpReferenceKF)
+            mCurrentFrame.mpReferenceKF = mpReferenceKF;
+
+        mLastFrame = Frame(mCurrentFrame);
+    }
+
+
+
+
+    if(mState==OK || mState==RECENTLY_LOST)
+    {
+        // Store frame pose information to retrieve the complete camera trajectory afterwards.
+        if(mCurrentFrame.isSet())
+        {
+            Sophus::SE3f Tcr_ = mCurrentFrame.GetPose() * mCurrentFrame.mpReferenceKF->GetPoseInverse();
+            mlRelativeFramePoses.push_back(Tcr_);
+            mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlbLost.push_back(mState==LOST);
+        }
+        else
+        {
+            // This can happen if tracking is lost
+            mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
+            mlpReferences.push_back(mlpReferences.back());
+            mlFrameTimes.push_back(mlFrameTimes.back());
+            mlbLost.push_back(mState==LOST);
+        }
+
+    }
+
+#ifdef REGISTER_LOOP
+    if (Stop()) {
+
+        // Safe area to stop
+        while(isStopped())
+        {
+            usleep(3000);
+        }
+    }
+#endif
+
+    return vectorList;
 }
 
 
