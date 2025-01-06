@@ -1,5 +1,7 @@
 # ORB-SLAM3
 
+### This is a fork of ORB-SLAM 3, which saves the currently visible feature points as 2D depth map to file.
+
 ### V1.0, December 22th, 2021
 **Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 
